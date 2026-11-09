@@ -45,7 +45,7 @@ function runFFmpeg(input, image, output) {
       output,
     ];
 
-    const proc = spawn("/usr/local/bin/ffmpeg", args);
+    const proc = spawn(process.env.FFMPEG_PATH || "ffmpeg", args);
 
     let errorText = "";
 
