@@ -4,69 +4,85 @@ import { NextResponse } from "next/server";
 import { spawn } from "node:child_process";
 import {
   mkdtemp,
-  mkdir,
   writeFile,
   rm,
   access,
+  stat,
 } from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+import {
+  S3Client,
+  PutObjectCommand,
+  DeleteObjectCommand,
+} from "@aws-sdk/client-s3";
 
 export const runtime = "nodejs";
+export const maxDuration = 300;
+
+const r2 = new S3Client({
+  region: "auto",
+  endpoint: process.env.R2_ENDPOINT,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+  },
+});
 
 function runFFmpeg(input, image, output) {
   return new Promise((resolve, reject) => {
     const args = [
       "-y",
-
+      "-hide_banner",
+      "-loglevel", "warning",
+      "-filter_threads", "1",
+      "-filter_complex_threads", "1",
       "-i", input,
       "-loop", "1",
       "-i", image,
-
       "-filter_complex",
-
-      "[1:v][0:v]scale=w=rw:h=rh[cat];[0:v][cat]overlay=0:0:enable='lt(mod(t,2),0.03)':format=auto[v]",
-
+      "[1:v]format=rgba,scale=iw*0.20:-1[wm];[0:v][wm]overlay=W-w-24:H-h-24:format=auto[v]",
       "-map", "[v]",
       "-map", "0:a?",
-
       "-c:v", "libx264",
-      "-preset", "veryfast",
+      "-preset", "ultrafast",
+      "-threads", "2",
       "-crf", "23",
       "-pix_fmt", "yuv420p",
-
       "-c:a", "aac",
       "-b:a", "128k",
-
       "-shortest",
       "-movflags", "+faststart",
-
       output,
     ];
 
-    const proc = spawn(process.env.FFMPEG_PATH || "ffmpeg", args);
+    const proc = spawn(
+      process.env.FFMPEG_PATH || "ffmpeg",
+      args
+    );
 
     let errorText = "";
 
     proc.stderr.on("data", (data) => {
       errorText += data.toString();
-
-      if (errorText.length > 12000) {
-        errorText = errorText.slice(-12000);
+      if (errorText.length > 15000) {
+        errorText = errorText.slice(-15000);
       }
     });
 
-    proc.on("error", reject);
+    proc.on("error", (error) => {
+      reject(new Error(`Unable to start FFmpeg: ${error.message}`));
+    });
 
-    proc.on("close", (code) => {
+    proc.on("close", (code, signal) => {
       if (code === 0) {
         resolve();
       } else {
         reject(
           new Error(
-            errorText.slice(-2000) ||
-            `FFmpeg exited with code ${code}`
+            `FFmpeg failed. Exit code: ${code}, Signal: ${signal}\n${errorText.slice(-5000)}`
           )
         );
       }
@@ -76,190 +92,209 @@ function runFFmpeg(input, image, output) {
 
 export async function POST(request) {
   let tempDir;
+  let lockClaimed = false;
+  let lockKey;
+  const uploadedKeys = [];
 
   try {
-    // Check Stripe secret key
-    if (!process.env.STRIPE_SECRET_KEY) {
-      throw new Error("Stripe secret key is missing");
+    const requiredVariables = [
+      "STRIPE_SECRET_KEY",
+      "R2_ENDPOINT",
+      "R2_ACCESS_KEY_ID",
+      "R2_SECRET_ACCESS_KEY",
+      "R2_BUCKET_NAME",
+    ];
+
+    for (const variable of requiredVariables) {
+      if (!process.env[variable]) {
+        return NextResponse.json(
+          { error: `Missing server variable: ${variable}` },
+          { status: 500 }
+        );
+      }
     }
 
-    // Read form data
     const form = await request.formData();
-
     const sessionId = form.get("session_id");
 
-    // Validate Stripe session
     if (
       typeof sessionId !== "string" ||
-      (
-        !sessionId.startsWith("cs_test_") &&
-        !sessionId.startsWith("cs_live_")
-      )
+      !/^cs_(test|live)_/.test(sessionId)
     ) {
       return NextResponse.json(
-        {
-          error: "A valid Stripe Checkout session is required.",
-        },
+        { error: "A valid Stripe Checkout session is required." },
         { status: 400 }
       );
     }
 
-    // Initialize Stripe
-    const stripe = new Stripe(
-      process.env.STRIPE_SECRET_KEY
-    );
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
 
-    // Retrieve payment session
-    const session = await stripe.checkout.sessions.retrieve(
-      sessionId
-    );
-
-    // Verify payment: $10 USD
     if (
       session.payment_status !== "paid" ||
       session.amount_total !== 1000 ||
       session.currency !== "usd"
     ) {
       return NextResponse.json(
-        {
-          error: "Payment not verified. Please complete the $10 checkout first.",
-        },
+        { error: "Payment not verified." },
         { status: 402 }
       );
     }
 
-    // Get uploaded videos
     const files = form.getAll("videos").filter(
-      (file) => file instanceof File && file.size > 0
+      (file) =>
+        file &&
+        typeof file.arrayBuffer === "function" &&
+        file.size > 0
     );
 
-    // Allow 1 to 3 videos
     if (files.length < 1 || files.length > 3) {
       return NextResponse.json(
-        {
-          error: "Choose between 1 and 3 videos.",
-        },
+        { error: "Choose between 1 and 3 videos." },
         { status: 400 }
       );
     }
 
-    // Validate video files
     for (const file of files) {
       if (
         !file.type.startsWith("video/") ||
         file.size > 250 * 1024 * 1024
       ) {
         return NextResponse.json(
-          {
-            error: "Each file must be a video smaller than 250 MB.",
-          },
+          { error: "Each file must be a video smaller than 250 MB." },
           { status: 400 }
         );
       }
     }
 
-    // Cat image path
+    // Create a unique payment lock key without exposing the Stripe ID.
+    const sessionHash = createHash("sha256")
+      .update(sessionId)
+      .digest("hex");
+
+    lockKey = `payment-locks/${sessionHash}.json`;
+
+    // Atomic create-once lock: only one request can claim this payment.
+    try {
+      await r2.send(
+        new PutObjectCommand({
+          Bucket: process.env.R2_BUCKET_NAME,
+          Key: lockKey,
+          Body: JSON.stringify({
+            sessionId,
+            status: "processing",
+            createdAt: new Date().toISOString(),
+          }),
+          ContentType: "application/json",
+          IfNoneMatch: "*",
+        })
+      );
+
+      lockClaimed = true;
+    } catch (error) {
+      if (
+        error.name === "PreconditionFailed" ||
+        error.$metadata?.httpStatusCode === 412
+      ) {
+        return NextResponse.json(
+          {
+            error: "This payment has already been used.",
+          },
+          { status: 409 }
+        );
+      }
+
+      throw error;
+    }
+
     const imagePath = path.join(
       process.cwd(),
       "public",
       "cat-image.png"
     );
 
-    // Check image exists
-    try {
-      await access(imagePath);
-    } catch {
-      return NextResponse.json(
-        {
-          error: "Missing public/cat-image.png. Add the cat image to the public folder.",
-        },
-        { status: 400 }
-      );
-    }
+    await access(imagePath);
 
-    // Create temporary directory
     tempDir = await mkdtemp(
       path.join(os.tmpdir(), "flashframe-")
     );
 
-    // Create downloads directory
-    const outputDir = path.join(
-      process.cwd(),
-      "public",
-      "downloads"
-    );
-
-    await mkdir(outputDir, {
-      recursive: true,
-    });
-
     const results = [];
 
-    // Process each video
     for (const file of files) {
       const id = randomUUID();
+      const inputPath = path.join(tempDir, `${id}-input`);
+      const outputPath = path.join(tempDir, `${id}.mp4`);
+      const objectKey = `processed/${id}.mp4`;
 
-      const inputPath = path.join(
-        tempDir,
-        `${id}-input`
-      );
-
-      const outputName = `${id}.mp4`;
-
-      const outputPath = path.join(
-        outputDir,
-        outputName
-      );
-
-      // Save uploaded video
       await writeFile(
         inputPath,
         Buffer.from(await file.arrayBuffer())
       );
 
-      // Apply full-screen cat image
-      await runFFmpeg(
-        inputPath,
-        imagePath,
-        outputPath
+      await runFFmpeg(inputPath, imagePath, outputPath);
+
+      const outputInfo = await stat(outputPath);
+
+      await r2.send(
+        new PutObjectCommand({
+          Bucket: process.env.R2_BUCKET_NAME,
+          Key: objectKey,
+          Body: createReadStream(outputPath),
+          ContentLength: outputInfo.size,
+          ContentType: "video/mp4",
+        })
       );
 
+      uploadedKeys.push(objectKey);
+
       results.push({
-        url: `/downloads/${outputName}`,
+        url: `/api/download/${id}.mp4`,
       });
     }
 
-    // Return processed videos
+    // Keep the lock permanently after successful processing.
     return NextResponse.json({
+      success: true,
       files: results,
     });
 
   } catch (error) {
-    console.error(
-      "FlashFrame processing error:",
-      error
-    );
+    console.error("FlashFrame processing error:", error);
+
+    // Remove uploaded videos if the job failed.
+    for (const key of uploadedKeys) {
+      await r2.send(
+        new DeleteObjectCommand({
+          Bucket: process.env.R2_BUCKET_NAME,
+          Key: key,
+        })
+      ).catch(() => {});
+    }
+
+    // Release the payment lock so a failed job can be retried.
+    if (lockClaimed && lockKey) {
+      await r2.send(
+        new DeleteObjectCommand({
+          Bucket: process.env.R2_BUCKET_NAME,
+          Key: lockKey,
+        })
+      ).catch(() => {});
+    }
 
     return NextResponse.json(
       {
-        error:
-          error.message ||
-          "Video processing failed.",
+        error: error.message || "Video processing failed.",
       },
       { status: 500 }
     );
 
   } finally {
-    // Remove temporary files
     if (tempDir) {
-      await rm(
-        tempDir,
-        {
-          recursive: true,
-          force: true,
-        }
-      ).catch(() => {});
+      await rm(tempDir, {
+        recursive: true,
+        force: true,
+      }).catch(() => {});
     }
   }
 }
-
