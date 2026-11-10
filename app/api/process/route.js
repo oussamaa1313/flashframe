@@ -12,7 +12,11 @@ import {
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { randomUUID, createHash } from "node:crypto";
+import {
+  randomUUID,
+  createHash,
+  createHmac,
+} from "node:crypto";
 import {
   S3Client,
   PutObjectCommand,
@@ -248,9 +252,18 @@ export async function POST(request) {
 
       uploadedKeys.push(objectKey);
 
-      results.push({
-        url: `/api/download/${id}.mp4`,
-      });
+     const expires = Math.floor(Date.now() / 1000) + 3600;
+
+const signature = createHmac(
+  "sha256",
+  process.env.DOWNLOAD_SECRET
+)
+  .update(`${id}.mp4:${expires}`)
+  .digest("hex");
+
+results.push({
+  url: `/api/download/${id}.mp4?expires=${expires}&signature=${signature}`,
+});
     }
 
     // Keep the lock permanently after successful processing.
